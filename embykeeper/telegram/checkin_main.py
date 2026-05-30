@@ -15,7 +15,6 @@ from embykeeper.utils import AsyncTaskPool, show_exception
 
 from .checkiner import BaseBotCheckin
 from .dynamic import extract, get_cls, get_names
-from .link import Link
 from .session import ClientsSession
 from .pyrogram import Client
 
@@ -303,9 +302,6 @@ class CheckinerManager:
                 log.warning("没有任何有效签到站点, 签到将跳过.")
             return
 
-        if not await Link(client).auth("checkiner", log_func=log.error):
-            return
-
         config_to_use = account.checkiner_config or config.checkiner
         sem = asyncio.Semaphore(config_to_use.concurrency)
         checkiners = []
@@ -418,5 +414,7 @@ class CheckinerManager:
         if not self._schedulers:
             logger.info("没有需要执行的 Telegram 机器人签到任务")
             return None
+
+        self._pool.add(self.run_all(instant=True), "启动时站点签到")
 
         await self._pool.wait()

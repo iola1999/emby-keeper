@@ -224,7 +224,7 @@ class Link:
             else:
                 message.continue_propagation()
 
-    async def auth(self, service: str, log_func=None):
+    async def auth(self, service: str, log_func=None, continue_on_timeout: bool = False):
         """向机器人发送授权请求."""
         async with authed_services_lock:
             user_auth_cache = authed_services.get(self.client.me.id, {}).get(service, None)
@@ -246,6 +246,12 @@ class Link:
                         fail=True,
                     )
                 except LinkError as e:
+                    if continue_on_timeout and "超时" in str(e):
+                        self.log.warning(
+                            f"服务 {service.upper()} 认证超时, 将继续执行本地功能; 需要云服务的功能仍会单独认证."
+                        )
+                        authed_services.setdefault(self.client.me.id, {})[service] = True
+                        return True
                     log_func(f"初始化错误: 使用 {service.upper()} 服务, 但{e}")
                     if "权限不足" in str(e):
                         await self._show_super_ad()
