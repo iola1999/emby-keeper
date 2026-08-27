@@ -17,6 +17,7 @@ import logging
 from rich.prompt import Prompt
 from loguru import logger
 import pyrogram
+import pyrogram.client as pyrogram_client_module
 from pyrogram import raw, types, filters, dispatcher
 from pyrogram.enums import SentCodeType
 from pyrogram.errors import (
@@ -39,6 +40,7 @@ from pyrogram.handlers import (
     ConnectHandler,
 )
 from pyrogram.storage.sqlite_storage import SQLiteStorage, TEST, PROD
+from pyrogram.session.session import Session as PyrogramSession, SessionState
 from pyrogram.handlers.handler import Handler
 
 from embykeeper import var, __name__ as __product__, __version__
@@ -347,6 +349,65 @@ class FileStorage(SQLiteStorage):
             raise
 
 
+class ManagedSession(PyrogramSession):
+    """合并 Kurigram 重连请求，并在关闭存储前停止重连。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._restarts_enabled = True
+        self._restart_scheduled = False
+        self._restart_task = None
+
+    @staticmethod
+    async def _skip_restart():
+        return None
+
+    def restart(self):
+        # 调用方创建 Task 前先设置标记，同一轮事件循环内的请求也能立即合并。
+        if not self._restarts_enabled or self._restart_scheduled:
+            return self._skip_restart()
+
+        self._restart_scheduled = True
+        return self._run_restart()
+
+    async def _run_restart(self):
+        self._restart_task = asyncio.current_task()
+        try:
+            while self._restarts_enabled:
+                async with self.restart_lock:
+                    if self.stored_msg_ids:
+                        self.recent_msg_ids = self.stored_msg_ids[:30]
+
+                    await super().stop()
+                    await super().start()
+
+                if self.state == SessionState.STARTED:
+                    return
+                await asyncio.sleep(self.RETRY_DELAY)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if self._restarts_enabled:
+                logger.warning(f"Telegram 会话重连已停止: {e}")
+        finally:
+            self._restart_task = None
+            self._restart_scheduled = False
+
+    async def disable_restarts(self):
+        self._restarts_enabled = False
+        task = self._restart_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+
+# Kurigram 通过这个模块级引用创建会话。
+pyrogram_client_module.Session = ManagedSession
+
+
 class Client(pyrogram.Client):
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
@@ -363,6 +424,26 @@ class Client(pyrogram.Client):
         self.dispatcher: Dispatcher = Dispatcher(self)
 
         self.stop_handlers = []
+
+    async def _disable_session_restarts(self):
+        sessions = [self.session, *self.sessions.values(), *self.media_sessions.values()]
+        unique_sessions = {id(session): session for session in sessions if session is not None}
+        await asyncio.gather(
+            *(
+                session.disable_restarts()
+                for session in unique_sessions.values()
+                if isinstance(session, ManagedSession)
+            ),
+            return_exceptions=True,
+        )
+
+    async def stop(self, block: bool = True, clear_handlers: bool = True):
+        await self._disable_session_restarts()
+        return await super().stop(block=block, clear_handlers=clear_handlers)
+
+    async def disconnect(self):
+        await self._disable_session_restarts()
+        return await super().disconnect()
 
     async def authorize(self):
         if self.bot_token:

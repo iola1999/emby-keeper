@@ -577,8 +577,10 @@ async def main(
                 await asyncio.gather(*[stream.join() for stream in streams])
     finally:
         from .runinfo import RunContext
+        from .cache import cache
 
         RunContext.cancel_all()
+        cache.flush()
 
 
 if __name__ == "__main__":

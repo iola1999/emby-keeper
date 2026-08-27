@@ -7,18 +7,17 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Callable, Dict, List
 import random
 import string
-from loguru import logger
 
-from rich.text import Text
 from pydantic import BaseModel, PrivateAttr
 
 from .utils import to_iterable
-from .cache import cache
-
 if TYPE_CHECKING:
     from loguru import Logger
 
 _running_runs: Dict[str, RunContext] = {}
+_completed_runs: Dict[str, RunContext] = {}
+_children: Dict[str, List[str]] = {}
+_MAX_COMPLETED_RUNS = 128
 
 
 class RunStatus(IntEnum):
@@ -46,7 +45,6 @@ class RunContext(BaseModel):
     _finished: Event = PrivateAttr(default_factory=Event)
     _started: Event = PrivateAttr(default_factory=Event)
     _cancel: Callable = PrivateAttr(default=None)
-    _handler_id: int = PrivateAttr(default=None)
 
     id: str
     parent_ids: List[str] = []
@@ -71,12 +69,9 @@ class RunContext(BaseModel):
 
         if status:
             self.status = status
-            self.log.append(
-                LogRecord(level="DEBUG", message=f"任务状态已设置为 {status.name}", time=datetime.now())
-            )
 
     def finish(self, status: RunStatus = None, status_info: str = None):
-        """完成任务, 记录状态和时间, 并保存到缓存"""
+        """完成任务并记录状态和时间"""
 
         # 设置结束状态
         self.set(status)
@@ -95,21 +90,22 @@ class RunContext(BaseModel):
         # 设置完成事件
         self._finished.set()
 
-        # 移除logger handler
-        if self._handler_id is not None:
-            try:
-                logger.remove(self._handler_id)
-            except ValueError:
-                pass
-
-        # 保存到缓存
+        # 只在进程内保留少量近期任务状态。
         self.save()
 
         return self
 
     def save(self):
-        """保存当前任务到缓存"""
-        cache.set(f"runinfo.{self.id}", self.model_dump_json())
+        """保留兼容接口；运行记录不再写入 cache.json。"""
+        _completed_runs[self.id] = self
+        while len(_completed_runs) > _MAX_COMPLETED_RUNS:
+            removed_id = next(iter(_completed_runs))
+            _completed_runs.pop(removed_id, None)
+            for parent_id, child_ids in list(_children.items()):
+                if removed_id in child_ids:
+                    _children[parent_id] = [child_id for child_id in child_ids if child_id != removed_id]
+                if not _children[parent_id]:
+                    del _children[parent_id]
 
     @classmethod
     def cancel_all(cls):
@@ -124,39 +120,32 @@ class RunContext(BaseModel):
         return logger.bind(run_id=self.id)
 
     @classmethod
-    def prepare(cls, description: str = None, parent_ids: List[str] = None):
+    def prepare(
+        cls,
+        description: str = None,
+        parent_ids: List[str] = None,
+        run_id: str = None,
+    ):
         """生成一个新的任务上下文"""
 
-        # 生成随机6位ID (大写字母和数字) 的运行时
-        chars = string.ascii_uppercase + string.digits
-        run_id = "".join(random.choices(chars, k=6))
+        if run_id is None:
+            chars = string.ascii_uppercase + string.digits
+            while True:
+                run_id = "".join(random.choices(chars, k=6))
+                if RunContext.get(run_id) is None:
+                    break
         run = cls(id=run_id, parent_ids=to_iterable(parent_ids))
         run.description = description
-
-        # 设置对 loguru 的监控
-        def log_sink(message):
-            record = message.record
-            if record["extra"].get("run_id") == run_id:
-                log_record = LogRecord(
-                    level=record["level"].name.upper(),
-                    message=record["message"],
-                    time=record["time"],
-                )
-                run.log.append(log_record)
-
-        # 添加日志处理器
-        run._handler_id = logger.add(log_sink, filter=lambda record: "run_id" in record["extra"])
 
         # 添加到运行中任务列表
         _running_runs[run_id] = run
 
-        # 如果有父任务, 记录父子关系
+        # 如果有父任务, 记录进程内父子关系
         if parent_ids:
             for parent_id in parent_ids:
-                children = cache.get(f"runinfo.children.{parent_id}", [])
+                children = _children.setdefault(parent_id, [])
                 if run_id not in children:
                     children.append(run_id)
-                    cache.set(f"runinfo.children.{parent_id}", children)
 
         return run
 
@@ -166,11 +155,7 @@ class RunContext(BaseModel):
         if run_id in _running_runs:
             return _running_runs[run_id]
 
-        # 从缓存加载
-        run_json = cache.get(f"runinfo.{run_id}")
-        if run_json:
-            return cls.model_validate_json(run_json)
-        return None
+        return _completed_runs.get(run_id)
 
     def get_parents(self):
         """获取所有父任务"""
@@ -184,7 +169,7 @@ class RunContext(BaseModel):
     def get_children(self):
         """获取所有子任务"""
         children = []
-        child_ids = cache.get(f"runinfo.children.{self.id}", [])
+        child_ids = _children.get(self.id, [])
         for child_id in child_ids:
             child = RunContext.get(child_id)
             if child:
@@ -208,16 +193,6 @@ class RunContext(BaseModel):
         logs.sort(key=lambda x: x.time, reverse=reverse)
         yield from logs
 
-    def log_sink(self, message):
-        record = message.record
-        if record["extra"].get("run_id") == self.id:
-            log_record = LogRecord(
-                level=record["level"].name.upper(),
-                message=Text(record["message"]).plain,
-                time=record["time"],
-            )
-            self.log.append(log_record)
-
     @classmethod
     def run(cls, func: Callable, description: str = None, parent_ids: List[str] = None):
         async def runner():
@@ -228,12 +203,17 @@ class RunContext(BaseModel):
             task = asyncio.create_task(func(ctx))
             ctx._cancel = task.cancel
             try:
-                return await task
+                result = await task
+                if ctx.id in _running_runs:
+                    ctx.finish(RunStatus.SUCCESS)
+                return result
             except asyncio.CancelledError:
-                ctx.finish(RunStatus.CANCELLED, "任务被取消")
+                if ctx.id in _running_runs:
+                    ctx.finish(RunStatus.CANCELLED, "任务被取消")
                 raise
-            except Exception as e:
-                ctx.finish(RunStatus.ERROR, f"任务发生错误")
+            except Exception:
+                if ctx.id in _running_runs:
+                    ctx.finish(RunStatus.ERROR, "任务发生错误")
                 raise
 
         return runner()
@@ -241,7 +221,7 @@ class RunContext(BaseModel):
     def get_running_children(self):
         """获取所有正在运行的子任务"""
         children = []
-        child_ids = cache.get(f"runinfo.children.{self.id}", [])
+        child_ids = _children.get(self.id, [])
         for child_id in child_ids:
             if child_id in _running_runs:
                 children.append(_running_runs[child_id])
@@ -272,7 +252,7 @@ class RunContext(BaseModel):
             existing = cls.get(run_id)
             if existing:
                 return existing
-        ctx = cls.prepare(description=description, parent_ids=parent_ids)
+        ctx = cls.prepare(description=description, parent_ids=parent_ids, run_id=run_id)
         if status:
             ctx.set(status)
         return ctx
